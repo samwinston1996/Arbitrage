@@ -1,0 +1,6 @@
+gym
+MetaTrader5
+stable-baselines3
+pandas
+numpy
+ta-lib
