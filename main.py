@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 from env.trading_env import TradingEnv
 import logging
+import os
 
 # Setup logging to track the trade decisions and rewards
 logging.basicConfig(level=logging.INFO)
@@ -14,8 +15,16 @@ def train_on_timeframe(timeframe):
     # Initialize the custom environment for each timeframe
     env = TradingEnv(timeframe=timeframe)
 
-    # Initialize RL agent using PPO
-    model = PPO('MlpPolicy', env, verbose=1)
+    model_path = f'models/agent_model_{timeframe}'
+    
+    # Check if a saved model exists, load it if available
+    if os.path.exists(f'{model_path}.zip'):
+        model = PPO.load(model_path, env=env)
+        logging.info(f"Loaded saved model for M{timeframe}.")
+    else:
+        # Initialize RL agent using PPO if no saved model exists
+        model = PPO('MlpPolicy', env, verbose=1)
+        logging.info(f"Training new model for M{timeframe}.")
 
     # Train the agent for 50,000 timesteps on the given timeframe
     model.learn(total_timesteps=50000)
@@ -41,7 +50,7 @@ def train_on_timeframe(timeframe):
     timeframe_rewards[timeframe] = rewards
 
     # Save the trained model for this timeframe
-    model.save(f'models/agent_model_{timeframe}')
+    model.save(model_path)
 
     # Close the environment
     env.close()

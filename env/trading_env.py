@@ -27,7 +27,7 @@ class TradingEnv(gym.Env):
 
         # Define action and observation space
         self.action_space = gym.spaces.Discrete(3)  # Buy, sell, or hold
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
 
         # Set timeframe based on user input
         self.timeframe = getattr(mt5, f'TIMEFRAME_{timeframe}')
@@ -54,9 +54,8 @@ class TradingEnv(gym.Env):
         logging.info(f"Action: {action}, Position: {self.position}, Reward: {reward}")
         return reward
 
-    def _check_exit_conditions(self, close_prices, ema50, supertrend, adx):
-        # Define exit conditions based on market indicators
-        # SuperTrend flip
+    def _check_exit_conditions(self, close_prices, ema50, supertrend, adx, volume, volatility):
+        # Define exit conditions based on market indicators and multiple features
         if self.position == "buy" and supertrend == -1:
             logging.info("Exit condition met: SuperTrend flipped bearish.")
             return True
@@ -73,8 +72,16 @@ class TradingEnv(gym.Env):
             return True
 
         # ADX shows weakening trend
-        if adx < 20:  # Example: ADX below 20 signals weak trend
+        if adx < 20:
             logging.info("Exit condition met: ADX is below threshold.")
+            return True
+
+        # Additional logic: Volume spike or extreme volatility
+        if volume > np.percentile(volume, 90):
+            logging.info("Exit condition met: Volume spike detected.")
+            return True
+        if volatility > np.percentile(volatility, 90):
+            logging.info("Exit condition met: High volatility detected.")
             return True
 
         return False
@@ -85,52 +92,65 @@ class TradingEnv(gym.Env):
 
         if xauusd_rates is None or len(xauusd_rates) == 0:
             logging.error("Error: No market data retrieved for XAUUSD")
-            return np.array([0] * 9), 0, True, {}
+            return np.array([0] * 11), 0, True, {}
 
         # Extract the relevant fields as floats
         close_prices = np.array([rate['close'] for rate in xauusd_rates], dtype=np.float64)
 
         # Calculate technical indicators
-        ema50 = ta.EMA(close_prices, timeperiod=50)[-1]  # 50 EMA
-        rsi = ta.RSI(close_prices, timeperiod=14)[-1]  # RSI
+        ema50 = ta.EMA(close_prices, timeperiod=50)[-1]
+        rsi = ta.RSI(close_prices, timeperiod=14)[-1]
         adx = ta.ADX(np.array([rate['high'] for rate in xauusd_rates], dtype=np.float64),
                      np.array([rate['low'] for rate in xauusd_rates], dtype=np.float64),
-                     close_prices, timeperiod=14)[-1]  # ADX
+                     close_prices, timeperiod=14)[-1]
+        volume = np.array([rate['tick_volume'] for rate in xauusd_rates], dtype=np.float64)
+        volatility = np.std(close_prices)
 
         # Simulate SuperTrend (basic example)
-        supertrend = np.where(close_prices[-1] > ema50, 1, -1)  # 1 for bullish, -1 for bearish
+        supertrend = np.where(close_prices[-1] > ema50, 1, -1)
 
         self.current_price = close_prices[-1]
 
-        # Create observation array with 9 values
-        obs = np.array([close_prices[-1], ema50, rsi, adx, supertrend, np.min(close_prices),
-                        np.max(close_prices), np.mean(close_prices), np.std(close_prices)])
+        # Create observation array with 11 values
+        obs = np.array([
+            close_prices[-1],  # Close price
+            ema50,
+            rsi,
+            adx,
+            supertrend,
+            np.min(close_prices),  # Low price in the window
+            np.max(close_prices),  # High price in the window
+            np.mean(close_prices),  # Mean price in the window
+            np.std(close_prices),  # Volatility (std dev)
+            volume[-1],  # Current volume
+            volatility  # Volatility (standard deviation)
+        ])
 
+        # Reward calculation
         if self.trade_open:
-            # Check exit conditions dynamically
-            if self._check_exit_conditions(close_prices, ema50, supertrend, adx):
-                reward = self._calculate_reward(action)  # Exit trade and calculate reward
+            if self._check_exit_conditions(close_prices, ema50, supertrend, adx, volume, volatility):
+                reward = self._calculate_reward(action)
                 self.trade_open = False  # Close the trade
-                logging.info(f"Trade closed. Reward: {reward} for {self.timeframe}")
+                logging.info(f"Trade closed. Reward: {reward} for -> M{self.timeframe}")
             else:
-                reward = 0  # Keep trade open, no reward yet
+                reward = 0
         else:
-            reward = 0  # No trade open, no reward
+            reward = 0
 
         # Action: 0 = Buy, 1 = Sell, 2 = Hold
         if not self.trade_open:
-            if action == 0:  # Buy
+            if action == 0:
                 self.entry_price = self.current_price
                 self.position = "buy"
                 self.trade_open = True
-                logging.info(f"Opening Buy trade at {self.current_price} for {self.timeframe}")
+                logging.info(f"Opening Buy trade at {self.current_price} for -> M{self.timeframe}")
             elif action == 1:  # Sell
                 self.entry_price = self.current_price
                 self.position = "sell"
                 self.trade_open = True
-                logging.info(f"Opening Sell trade at {self.current_price} for {self.timeframe}")
+                logging.info(f"Opening Sell trade at {self.current_price} for -> M{self.timeframe}")
 
-        done = False  # Or any other logic you need to finish the episode
+        done = False
         return obs, reward, done, {}
 
     def reset(self):
@@ -139,7 +159,7 @@ class TradingEnv(gym.Env):
         self.trade_open = False
         self.position = None
         logging.info("Environment reset")
-        return np.zeros(9, dtype=np.float32)
+        return np.zeros(11, dtype=np.float32)
 
     def close(self):
         mt5.shutdown()
