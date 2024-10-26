@@ -18,8 +18,8 @@ if not mt5.initialize():
     quit()
 
 # Login to MetaTrader5 with credentials
-login = 62061021  # Replace with your account number
-password = 'Mailsam96@'  # Replace with your password
+login =   # Replace with your account number
+password = '@'  # Replace with your password
 server = 'PepperstoneUK-Demo'  # Replace with your server name
 
 if not mt5.login(login, password=password, server=server):
@@ -28,6 +28,11 @@ if not mt5.login(login, password=password, server=server):
     quit()
 else:
     logging.info("MetaTrader5 initialized and logged in")
+
+# Define the symbol filling mode flags
+SYMBOL_FILLING_FLAG_FOK = 1 << 0     # 1
+SYMBOL_FILLING_FLAG_IOC = 1 << 1     # 2
+SYMBOL_FILLING_FLAG_RETURN = 1 << 2  # 4
 
 class TradingEnv(gym.Env):
     def __init__(self, symbol='XAUUSD', timeframe='M1', lot_size=0.01):
@@ -43,8 +48,10 @@ class TradingEnv(gym.Env):
         self.action_space = spaces.Discrete(3)  # Buy, Sell, or Hold
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
 
-        # For storing previous indicators to compute changes
+        # Initialize variables
         self.prev_observation = None
+        self.position = None  # Initialize position to None
+        self.market_closed = False  # Initialize market_closed flag
 
         # Initialize account info
         self.account_info = mt5.account_info()
@@ -55,16 +62,24 @@ class TradingEnv(gym.Env):
 
     def reset(self):
         self.prev_observation = None
+        self.position = None  # Reset position to None
+        self.market_closed = False  # Reset market_closed flag
         logging.info(f"Environment reset for timeframe {self.timeframe_name}")
         return np.zeros(11, dtype=np.float32)
 
     def step(self, action):
+        if self.market_closed:
+            # Skip processing if market is closed
+            time.sleep(60)  # Wait for 1 minute before checking again
+            return self.prev_observation or np.zeros(11), 0, False, {}
+
         # Retrieve market data
         rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, 500)
 
         if rates is None or len(rates) == 0:
             logging.error("No market data retrieved")
-            return np.zeros(11), 0, True, {}
+            time.sleep(60)  # Wait before retrying
+            return np.zeros(11), 0, False, {}
 
         # Prepare data
         close_prices = rates['close'].astype(np.float64)
@@ -134,14 +149,18 @@ class TradingEnv(gym.Env):
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logging.info(f"Opened Buy position at {result.price} on {self.symbol} ({self.timeframe_name})")
                     self.position = 'buy'
+                else:
+                    self.position = None
             elif action == 1:  # Sell
                 result = self.open_position('SELL')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logging.info(f"Opened Sell position at {result.price} on {self.symbol} ({self.timeframe_name})")
                     self.position = 'sell'
+                else:
+                    self.position = None
             else:
                 # Hold
-                pass
+                self.position = None
         else:
             # Manage existing positions
             for position in positions:
@@ -195,9 +214,15 @@ class TradingEnv(gym.Env):
 
         result = mt5.order_send(request)
         if result.retcode != mt5.TRADE_RETCODE_DONE:
+            error_message = result.comment.lower()
             logging.error(f"Failed to open position: {result.comment}")
+            if "market closed" in error_message:
+                logging.info(f"Market is closed for {self.symbol}. Pausing trading for this symbol.")
+                self.market_closed = True  # Set the flag to indicate market closure
             return None
 
+        # Reset market closed flag if order is successful
+        self.market_closed = False
         return result
 
     def close_position(self, position):
@@ -237,11 +262,11 @@ class TradingEnv(gym.Env):
 
     def get_filling_mode(self, symbol_info):
         filling_modes = []
-        if symbol_info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+        if symbol_info.filling_mode & SYMBOL_FILLING_FLAG_FOK:
             filling_modes.append(mt5.ORDER_FILLING_FOK)
-        if symbol_info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+        if symbol_info.filling_mode & SYMBOL_FILLING_FLAG_IOC:
             filling_modes.append(mt5.ORDER_FILLING_IOC)
-        if symbol_info.filling_mode & mt5.SYMBOL_FILLING_RETURN:
+        if symbol_info.filling_mode & SYMBOL_FILLING_FLAG_RETURN:
             filling_modes.append(mt5.ORDER_FILLING_RETURN)
         if filling_modes:
             return filling_modes[0]  # Use the first supported filling mode
@@ -254,7 +279,7 @@ class TradingEnv(gym.Env):
         stop_loss = -10.0    # Maximum loss per trade is $10
 
         # Calculate trade duration
-        position_duration = time.time() - position.time
+        position_duration = time.time() - position.time_msc / 1000.0  # Convert from milliseconds to seconds
         minimum_duration = 60  # 60 seconds; adjust as needed
 
         if (current_profit >= profit_target or current_profit <= stop_loss) and position_duration >= minimum_duration:
@@ -300,19 +325,27 @@ try:
     obs = {tf: envs[tf].reset() for tf in timeframes}
     while True:
         for tf in timeframes:
+            env = envs[tf]
+            if env.market_closed:
+                logging.info(f"Market is closed for timeframe {tf}. Skipping.")
+                continue  # Skip this timeframe if market is closed
+
             action, _states = models[tf].predict(obs[tf], deterministic=True)
-            obs[tf], reward, done, info = envs[tf].step(action)
+            try:
+                obs[tf], reward, done, info = env.step(action)
+            except Exception as e:
+                logging.error(f"Error in timeframe {tf}: {e}")
+                # Sleep to prevent flooding and retry after some time
+                time.sleep(60)
+                continue  # Skip to the next timeframe
             if reward != 0:
                 # Train the model with the obtained reward
                 models[tf].learn(total_timesteps=1)
-            # Sleep for 5 seconds to limit the rate of requests
-            time.sleep(5)
+            # Sleep for a short time to limit the rate of requests
+            time.sleep(1)
 
 except KeyboardInterrupt:
     logging.info("Interrupted by user")
-
-except Exception as e:
-    logging.error(f"An error occurred: {e}")
 
 finally:
     for tf in timeframes:
