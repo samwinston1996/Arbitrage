@@ -1,5 +1,3 @@
-# trading_agent.py
-
 import MetaTrader5 as mt5
 import gym
 from gym import spaces
@@ -20,9 +18,9 @@ if not mt5.initialize():
     quit()
 
 # Login to MetaTrader5 with credentials
-login = 12345  # Replace with your account number
-password = '"'  # Replace with your password
-server = 'Demo'  # Replace with your server name
+login = 62061021  # Replace with your account number
+password = 'Mailsam96@'  # Replace with your password
+server = 'PepperstoneUK-Demo'  # Replace with your server name
 
 if not mt5.login(login, password=password, server=server):
     logging.error(f"Failed to login to MetaTrader5, error: {mt5.last_error()}")
@@ -45,13 +43,6 @@ class TradingEnv(gym.Env):
         self.action_space = spaces.Discrete(3)  # Buy, Sell, or Hold
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
 
-        # Initialize trading parameters
-        self.current_price = None
-        self.entry_price = None
-        self.trade_open = False
-        self.position = None  # "buy" or "sell"
-        self.ticket = None  # Trade ticket number
-
         # For storing previous indicators to compute changes
         self.prev_observation = None
 
@@ -63,11 +54,6 @@ class TradingEnv(gym.Env):
             quit()
 
     def reset(self):
-        self.current_price = None
-        self.entry_price = None
-        self.trade_open = False
-        self.position = None
-        self.ticket = None
         self.prev_observation = None
         logging.info(f"Environment reset for timeframe {self.timeframe_name}")
         return np.zeros(11, dtype=np.float32)
@@ -93,11 +79,11 @@ class TradingEnv(gym.Env):
         volatility = np.std(close_prices[-20:])
         supertrend = self.calculate_supertrend(high_prices, low_prices, close_prices)
 
-        self.current_price = close_prices[-1]
+        current_price = close_prices[-1]
 
         # Observation
         obs = np.array([
-            close_prices[-1],        # Latest close price
+            current_price,        # Latest close price
             ema50,
             rsi,
             adx,
@@ -111,7 +97,7 @@ class TradingEnv(gym.Env):
         ], dtype=np.float32)
 
         # Execute action
-        reward = self.execute_trade(action)
+        reward = self.execute_trade(action, current_price)
 
         # Log current market price and action
         self.log_market_data(obs, action, reward)
@@ -126,60 +112,53 @@ class TradingEnv(gym.Env):
         return obs, reward, done, info
 
     def calculate_supertrend(self, high, low, close):
-        # Placeholder for SuperTrend calculation
         # Implement SuperTrend calculation or use a library function
-        # For demonstration, we'll use a simple trend indicator
+        # Placeholder implementation
         if close[-1] > ta.SMA(close, timeperiod=10)[-1]:
             return 1  # Bullish
         else:
             return -1  # Bearish
 
-    def execute_trade(self, action):
+    def execute_trade(self, action, current_price):
         reward = 0
 
-        # Check for existing positions
-        positions = mt5.positions_get(symbol=self.symbol)
-        position_exists = len(positions) > 0
+        # Get positions for this symbol and timeframe
+        all_positions = mt5.positions_get(symbol=self.symbol)
+        positions = [pos for pos in all_positions if pos.comment == f"RL Agent {self.timeframe_name}"]
+        positions_count = len(positions)
 
-        if not position_exists:
+        if positions_count < 1:
+            # Can open a new position
             if action == 0:  # Buy
                 result = self.open_position('BUY')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    self.trade_open = True
+                    logging.info(f"Opened Buy position at {result.price} on {self.symbol} ({self.timeframe_name})")
                     self.position = 'buy'
-                    self.entry_price = result.price
-                    self.ticket = result.order
-                    logging.info(f"Opened Buy position at {self.entry_price} on {self.symbol} ({self.timeframe_name})")
             elif action == 1:  # Sell
                 result = self.open_position('SELL')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    self.trade_open = True
+                    logging.info(f"Opened Sell position at {result.price} on {self.symbol} ({self.timeframe_name})")
                     self.position = 'sell'
-                    self.entry_price = result.price
-                    self.ticket = result.order
-                    logging.info(f"Opened Sell position at {self.entry_price} on {self.symbol} ({self.timeframe_name})")
             else:
                 # Hold
                 pass
         else:
-            # Manage existing position
-            position = positions[0]
-            self.position = 'buy' if position.type == mt5.ORDER_TYPE_BUY else 'sell'
-            self.entry_price = position.price_open
-            self.trade_open = True
-            self.ticket = position.ticket
+            # Manage existing positions
+            for position in positions:
+                # Determine the position's current profit
+                if position.type == mt5.ORDER_TYPE_BUY:
+                    current_price = mt5.symbol_info_tick(self.symbol).bid
+                    current_profit = (current_price - position.price_open) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+                else:  # SELL position
+                    current_price = mt5.symbol_info_tick(self.symbol).ask
+                    current_profit = (position.price_open - current_price) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
 
-            # Check exit conditions
-            if self.check_exit_conditions():
-                result = self.close_position(position)
-                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    profit = position.profit
-                    reward = profit
-                    logging.info(f"Closed {self.position.capitalize()} position at {self.current_price} with profit {profit} ({self.timeframe_name})")
-                    self.trade_open = False
-                    self.position = None
-                    self.entry_price = None
-                    self.ticket = None
+                # Check exit conditions
+                if self.check_exit_conditions(current_profit, position):
+                    result = self.close_position(position)
+                    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logging.info(f"Closed {'Buy' if position.type == mt5.ORDER_TYPE_BUY else 'Sell'} position at {current_price} with profit {position.profit} ({self.timeframe_name})")
+                        reward += position.profit  # Sum up profits from closed positions
 
         return reward
 
@@ -196,6 +175,11 @@ class TradingEnv(gym.Env):
 
         price = mt5.symbol_info_tick(self.symbol).ask if direction == 'BUY' else mt5.symbol_info_tick(self.symbol).bid
 
+        # Determine filling mode
+        filling_type = self.get_filling_mode(symbol_info)
+        if filling_type is None:
+            return None
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
@@ -206,7 +190,7 @@ class TradingEnv(gym.Env):
             "magic": 234000,
             "comment": f"RL Agent {self.timeframe_name}",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK,
+            "type_filling": filling_type,
         }
 
         result = mt5.order_send(request)
@@ -217,6 +201,16 @@ class TradingEnv(gym.Env):
         return result
 
     def close_position(self, position):
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info is None:
+            logging.error(f"{self.symbol} not found")
+            return None
+
+        # Determine filling mode
+        filling_type = self.get_filling_mode(symbol_info)
+        if filling_type is None:
+            return None
+
         direction = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = mt5.symbol_info_tick(self.symbol).bid if direction == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(self.symbol).ask
 
@@ -231,7 +225,7 @@ class TradingEnv(gym.Env):
             "magic": 234000,
             "comment": f"RL Agent Close {self.timeframe_name}",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK,
+            "type_filling": filling_type,
         }
 
         result = mt5.order_send(request)
@@ -241,25 +235,34 @@ class TradingEnv(gym.Env):
 
         return result
 
-    def check_exit_conditions(self):
-        # Implement your exit conditions here
-        # For demonstration, we'll use a simple profit target and stop loss
-        profit_target = 1.0  # Adjust as needed
-        stop_loss = -1.0     # Adjust as needed
+    def get_filling_mode(self, symbol_info):
+        filling_modes = []
+        if symbol_info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+            filling_modes.append(mt5.ORDER_FILLING_FOK)
+        if symbol_info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+            filling_modes.append(mt5.ORDER_FILLING_IOC)
+        if symbol_info.filling_mode & mt5.SYMBOL_FILLING_RETURN:
+            filling_modes.append(mt5.ORDER_FILLING_RETURN)
+        if filling_modes:
+            return filling_modes[0]  # Use the first supported filling mode
+        else:
+            logging.error(f"No acceptable filling mode found for symbol {self.symbol}")
+            return None
 
-        current_profit = 0
-        if self.position == 'buy':
-            current_profit = self.current_price - self.entry_price
-        elif self.position == 'sell':
-            current_profit = self.entry_price - self.current_price
+    def check_exit_conditions(self, current_profit, position):
+        profit_target = 1.0  # At least $1 profit
+        stop_loss = -10.0    # Maximum loss per trade is $10
 
-        if current_profit >= profit_target or current_profit <= stop_loss:
+        # Calculate trade duration
+        position_duration = time.time() - position.time
+        minimum_duration = 60  # 60 seconds; adjust as needed
+
+        if (current_profit >= profit_target or current_profit <= stop_loss) and position_duration >= minimum_duration:
             return True
         else:
             return False
 
     def log_market_data(self, obs, action, reward):
-        # Create a DataFrame for structured output
         data = {
             'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'Symbol': self.symbol,
@@ -274,7 +277,7 @@ class TradingEnv(gym.Env):
             'Reward': reward
         }
         df = pd.DataFrame([data])
-        logging.info("\n" + df.to_string(index=False))
+        print(df.to_string(index=False))
 
     def render(self, mode='human'):
         pass
@@ -286,6 +289,7 @@ class TradingEnv(gym.Env):
 timeframes = ['M1', 'M5', 'M15']
 envs = {}
 models = {}
+max_trades_per_timeframe = 3
 
 for tf in timeframes:
     envs[tf] = TradingEnv(symbol='XAUUSD', timeframe=tf)
@@ -294,20 +298,8 @@ for tf in timeframes:
 # Live trading loop
 try:
     obs = {tf: envs[tf].reset() for tf in timeframes}
-    last_update_time = {tf: 0 for tf in timeframes}
     while True:
         for tf in timeframes:
-            current_time = time.time()
-            # Check if it's time to update based on the timeframe
-            if tf == 'M1' and current_time - last_update_time[tf] >= 5:
-                last_update_time[tf] = current_time
-            elif tf == 'M5' and current_time - last_update_time[tf] >= 5:
-                last_update_time[tf] = current_time
-            elif tf == 'M15' and current_time - last_update_time[tf] >= 5:
-                last_update_time[tf] = current_time
-            else:
-                continue  # Skip until it's time to update
-
             action, _states = models[tf].predict(obs[tf], deterministic=True)
             obs[tf], reward, done, info = envs[tf].step(action)
             if reward != 0:
