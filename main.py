@@ -7,6 +7,7 @@ from stable_baselines3 import PPO
 import logging
 import time
 import pandas as pd
+import os
 from datetime import datetime
 
 # Initialize logging
@@ -35,7 +36,7 @@ SYMBOL_FILLING_FLAG_IOC = 1 << 1     # 2
 SYMBOL_FILLING_FLAG_RETURN = 1 << 2  # 4
 
 class TradingEnv(gym.Env):
-    def __init__(self, symbol='XAUUSD', timeframe='M1', lot_size=0.01):
+    def __init__(self, symbol='BTCUSD', timeframe='M1', lot_size=0.01):
         super(TradingEnv, self).__init__()
 
         # Set symbol and timeframe
@@ -345,15 +346,37 @@ class TradingEnv(gym.Env):
 timeframes = ['M1', 'M5', 'M15']
 envs = {}
 models = {}
+model_paths = {}
+training_start_time = time.time()
+training_duration = 24 * 60 * 60  # Train for 1 day (24 hours)
 
 for tf in timeframes:
-    envs[tf] = TradingEnv(symbol='XAUUSD', timeframe=tf)
-    models[tf] = PPO('MlpPolicy', envs[tf], verbose=0)
+    envs[tf] = TradingEnv(symbol='BTCUSD', timeframe=tf)
+    model_path = f"ppo_model_{tf}.zip"
+    model_paths[tf] = model_path
+
+    if os.path.exists(model_path):
+        # Load the existing model
+        models[tf] = PPO.load(model_path, env=envs[tf])
+        logging.info(f"Loaded existing model for timeframe {tf}")
+    else:
+        # Create a new model
+        models[tf] = PPO('MlpPolicy', envs[tf], verbose=0)
+        logging.info(f"Created new model for timeframe {tf}")
 
 # Live trading loop
 try:
     obs = {tf: envs[tf].reset() for tf in timeframes}
     while True:
+        current_time = time.time()
+        elapsed_time = current_time - training_start_time
+        if elapsed_time >= training_duration:
+            logging.info("Training duration reached. Saving models and stopping training.")
+            # Save the models
+            for tf in timeframes:
+                models[tf].save(model_paths[tf])
+            break  # Exit the loop
+
         for tf in timeframes:
             env = envs[tf]
             if env.market_closed:
@@ -378,7 +401,9 @@ except KeyboardInterrupt:
     logging.info("Interrupted by user")
 
 finally:
+    # Save models before exiting
     for tf in timeframes:
+        models[tf].save(model_paths[tf])
         envs[tf].close()
     mt5.shutdown()
     logging.info("Trading session ended")
