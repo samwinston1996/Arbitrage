@@ -3,7 +3,7 @@ import gym
 from gym import spaces
 import numpy as np
 import talib as ta
-from stable_baselines3 import PPO
+from stable_baselines3 import RecurrentPPO
 import logging
 import time
 import pandas as pd
@@ -321,21 +321,24 @@ last_save_time = training_start_time
 
 for tf in timeframes:
     envs[tf] = TradingEnv(symbol='BTCUSD', timeframe=tf, lot_size=0.01)
-    model_path = f"ppo_model_{tf}.zip"
+    model_path = f"recurrent_ppo_model_{tf}.zip"
     model_paths[tf] = model_path
 
     if os.path.exists(model_path):
         # Load the existing model
-        models[tf] = PPO.load(model_path, env=envs[tf])
+        models[tf] = RecurrentPPO.load(model_path, env=envs[tf])
         logging.info(f"Loaded existing model for timeframe {tf}")
     else:
-        # Create a new model
-        models[tf] = PPO('MlpPolicy', envs[tf], verbose=0)
-        logging.info(f"Created new model for timeframe {tf}")
+        # Create a new model with LSTM policy
+        models[tf] = RecurrentPPO('MlpLstmPolicy', envs[tf], verbose=0)
+        logging.info(f"Created new RecurrentPPO model for timeframe {tf}")
 
 # Live trading loop
 try:
     obs = {tf: envs[tf].reset() for tf in timeframes}
+    lstm_states = {tf: None for tf in timeframes}  # Initialize LSTM states
+    episode_starts = {tf: True for tf in timeframes}  # Track the start of episodes
+
     while True:
         current_time = time.time()
         elapsed_time = current_time - training_start_time
@@ -356,7 +359,13 @@ try:
 
         for tf in timeframes:
             env = envs[tf]
-            action, _states = models[tf].predict(obs[tf], deterministic=False)  # Use stochastic policy for exploration
+            # Get the previous LSTM state and episode start
+            lstm_state = lstm_states[tf]
+            episode_start = episode_starts[tf]
+
+            action, lstm_states[tf] = models[tf].predict(obs[tf], state=lstm_state, episode_start=episode_start, deterministic=False)
+            episode_starts[tf] = False  # After the first step, episode has started
+
             try:
                 obs[tf], reward, done, info = env.step(action)
             except Exception as e:
@@ -364,9 +373,18 @@ try:
                 # Sleep to prevent flooding and retry after some time
                 time.sleep(60)
                 continue  # Skip to the next timeframe
+
             if reward != 0:
                 # Train the model with the obtained reward
-                models[tf].learn(total_timesteps=1)
+                # Note: For RecurrentPPO, we typically collect rollouts and train periodically
+                pass  # In live trading, immediate training may not be feasible
+
+            # If done, reset the environment and LSTM states
+            if done:
+                obs[tf] = env.reset()
+                lstm_states[tf] = None
+                episode_starts[tf] = True
+
             # Sleep for a short time to limit the rate of requests
             time.sleep(1)
 
