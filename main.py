@@ -18,8 +18,8 @@ if not mt5.initialize():
     quit()
 
 # Login to MetaTrader5 with credentials
-login =   # Replace with your account number
-password = '@'  # Replace with your password
+login = 62061021  # Replace with your account number
+password = 'your_password'  # Replace with your password
 server = 'PepperstoneUK-Demo'  # Replace with your server name
 
 if not mt5.login(login, password=password, server=server):
@@ -52,6 +52,8 @@ class TradingEnv(gym.Env):
         self.prev_observation = None
         self.position = None  # Initialize position to None
         self.market_closed = False  # Initialize market_closed flag
+        self.last_log_time = 0  # For controlling log output frequency
+        self.current_profit = 0  # To store current profit
 
         # Initialize account info
         self.account_info = mt5.account_info()
@@ -64,6 +66,8 @@ class TradingEnv(gym.Env):
         self.prev_observation = None
         self.position = None  # Reset position to None
         self.market_closed = False  # Reset market_closed flag
+        self.last_log_time = 0  # Reset log timer
+        self.current_profit = 0  # Reset profit
         logging.info(f"Environment reset for timeframe {self.timeframe_name}")
         return np.zeros(11, dtype=np.float32)
 
@@ -111,11 +115,14 @@ class TradingEnv(gym.Env):
             volatility
         ], dtype=np.float32)
 
-        # Execute action
+        # Execute action and calculate reward
         reward = self.execute_trade(action, current_price)
 
-        # Log current market price and action
-        self.log_market_data(obs, action, reward)
+        # Log current market price and action every 10 seconds
+        current_time = time.time()
+        if current_time - self.last_log_time >= 10:
+            self.log_market_data(obs, action, reward)
+            self.last_log_time = current_time
 
         # Check if done (we'll keep it always False for live trading)
         done = False
@@ -142,7 +149,10 @@ class TradingEnv(gym.Env):
         positions = [pos for pos in all_positions if pos.comment == f"RL Agent {self.timeframe_name}"]
         positions_count = len(positions)
 
-        if positions_count < 1:
+        # Maximum trades per timeframe
+        max_trades = 3
+
+        if positions_count < max_trades:
             # Can open a new position
             if action == 0:  # Buy
                 result = self.open_position('BUY')
@@ -162,22 +172,42 @@ class TradingEnv(gym.Env):
                 # Hold
                 self.position = None
         else:
-            # Manage existing positions
-            for position in positions:
-                # Determine the position's current profit
-                if position.type == mt5.ORDER_TYPE_BUY:
-                    current_price = mt5.symbol_info_tick(self.symbol).bid
-                    current_profit = (current_price - position.price_open) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
-                else:  # SELL position
-                    current_price = mt5.symbol_info_tick(self.symbol).ask
-                    current_profit = (position.price_open - current_price) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+            # Can't open more positions
+            pass
 
-                # Check exit conditions
-                if self.check_exit_conditions(current_profit, position):
-                    result = self.close_position(position)
-                    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                        logging.info(f"Closed {'Buy' if position.type == mt5.ORDER_TYPE_BUY else 'Sell'} position at {current_price} with profit {position.profit} ({self.timeframe_name})")
-                        reward += position.profit  # Sum up profits from closed positions
+        # Manage existing positions
+        reward += self.manage_positions()
+
+        return reward
+
+    def manage_positions(self):
+        reward = 0
+        positions = mt5.positions_get(symbol=self.symbol)
+        positions = [pos for pos in positions if pos.comment == f"RL Agent {self.timeframe_name}"]
+
+        self.current_profit = 0  # Reset current profit
+
+        for position in positions:
+            # Determine the position's current profit
+            if position.type == mt5.ORDER_TYPE_BUY:
+                current_price = mt5.symbol_info_tick(self.symbol).bid
+                current_profit = (current_price - position.price_open) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+            else:  # SELL position
+                current_price = mt5.symbol_info_tick(self.symbol).ask
+                current_profit = (position.price_open - current_price) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+
+            # Accumulate current profit
+            self.current_profit += current_profit
+
+            # Check exit conditions
+            if self.check_exit_conditions(current_profit, position):
+                result = self.close_position(position)
+                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"Closed {'Buy' if position.type == mt5.ORDER_TYPE_BUY else 'Sell'} position at {current_price} with profit {position.profit} ({self.timeframe_name})")
+                    reward += position.profit  # Sum up profits from closed positions
+
+        # Provide continuous reward based on current profit
+        reward += self.current_profit
 
         return reward
 
@@ -275,14 +305,17 @@ class TradingEnv(gym.Env):
             return None
 
     def check_exit_conditions(self, current_profit, position):
-        profit_target = 1.0  # At least $1 profit
-        stop_loss = -10.0    # Maximum loss per trade is $10
+        profit_target = 1.0   # At least $1 profit
+        stop_loss = -10.0     # Maximum loss per trade is $10
 
         # Calculate trade duration
         position_duration = time.time() - position.time_msc / 1000.0  # Convert from milliseconds to seconds
         minimum_duration = 60  # 60 seconds; adjust as needed
 
-        if (current_profit >= profit_target or current_profit <= stop_loss) and position_duration >= minimum_duration:
+        if position_duration < minimum_duration:
+            return False
+
+        if current_profit >= profit_target or current_profit <= stop_loss:
             return True
         else:
             return False
@@ -293,16 +326,14 @@ class TradingEnv(gym.Env):
             'Symbol': self.symbol,
             'Timeframe': self.timeframe_name,
             'Price': obs[0],
-            'EMA50': obs[1],
-            'RSI': obs[2],
-            'ADX': obs[3],
-            'SuperTrend': obs[4],
             'Action': ['Buy', 'Sell', 'Hold'][action],
             'Position': self.position,
-            'Reward': reward
+            'Current Profit': round(self.current_profit, 2),
+            'Reward': round(reward, 2)
         }
-        df = pd.DataFrame([data])
-        print(df.to_string(index=False))
+        # Print as a single line without headers
+        output = f"{data['Time']} | {data['Symbol']} | TF: {data['Timeframe']} | Price: {data['Price']:.2f} | Action: {data['Action']} | Position: {data['Position']} | Profit: {data['Current Profit']:.2f} | Reward: {data['Reward']:.2f}"
+        print(output)
 
     def render(self, mode='human'):
         pass
@@ -314,7 +345,6 @@ class TradingEnv(gym.Env):
 timeframes = ['M1', 'M5', 'M15']
 envs = {}
 models = {}
-max_trades_per_timeframe = 3
 
 for tf in timeframes:
     envs[tf] = TradingEnv(symbol='XAUUSD', timeframe=tf)
