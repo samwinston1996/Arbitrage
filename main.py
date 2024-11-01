@@ -46,7 +46,8 @@ class TradingEnv(gym.Env):
         self.lot_size = lot_size
 
         # Define action and observation space
-        self.action_space = spaces.Discrete(3)  # Buy, Sell, or Hold
+        # Actions: 0 = Buy, 1 = Sell, 2 = Hold, 3 = Close Position
+        self.action_space = spaces.Discrete(4)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
 
         # Initialize variables
@@ -55,6 +56,7 @@ class TradingEnv(gym.Env):
         self.market_closed = False  # Initialize market_closed flag
         self.last_log_time = 0  # For controlling log output frequency
         self.current_profit = 0  # To store current profit
+        self.position_type = None  # Track the type of the open position
 
         # Initialize account info
         self.account_info = mt5.account_info()
@@ -69,15 +71,11 @@ class TradingEnv(gym.Env):
         self.market_closed = False  # Reset market_closed flag
         self.last_log_time = 0  # Reset log timer
         self.current_profit = 0  # Reset profit
+        self.position_type = None  # Reset position type
         logging.info(f"Environment reset for timeframe {self.timeframe_name}")
         return np.zeros(11, dtype=np.float32)
 
     def step(self, action):
-        if self.market_closed:
-            # Skip processing if market is closed
-            time.sleep(60)  # Wait for 1 minute before checking again
-            return self.prev_observation or np.zeros(11), 0, False, {}
-
         # Retrieve market data
         rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, 500)
 
@@ -150,67 +148,58 @@ class TradingEnv(gym.Env):
         positions = [pos for pos in all_positions if pos.comment == f"RL Agent {self.timeframe_name}"]
         positions_count = len(positions)
 
-        # Maximum trades per timeframe
-        max_trades = 3
+        if positions_count > 0:
+            # There is an open position
+            position = positions[0]
+            self.position_type = 'buy' if position.type == mt5.ORDER_TYPE_BUY else 'sell'
 
-        if positions_count < max_trades:
-            # Can open a new position
+            # Calculate current profit
+            current_profit = self.calculate_current_profit(position)
+
+            # Agent can decide to close the position
+            if action == 3:  # Close Position
+                result = self.close_position(position)
+                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"Closed position at {current_price} with profit {position.profit} ({self.timeframe_name})")
+                    reward += current_profit  # Reward is the profit from the trade
+                    self.position = None
+                    self.position_type = None
+            else:
+                # Provide continuous reward based on current profit
+                reward += current_profit
+        else:
+            # No open position
+            self.position_type = None
             if action == 0:  # Buy
                 result = self.open_position('BUY')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logging.info(f"Opened Buy position at {result.price} on {self.symbol} ({self.timeframe_name})")
                     self.position = 'buy'
-                else:
-                    self.position = None
+                    self.position_type = 'buy'
             elif action == 1:  # Sell
                 result = self.open_position('SELL')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logging.info(f"Opened Sell position at {result.price} on {self.symbol} ({self.timeframe_name})")
                     self.position = 'sell'
-                else:
-                    self.position = None
+                    self.position_type = 'sell'
             else:
                 # Hold
                 self.position = None
-        else:
-            # Can't open more positions
-            pass
-
-        # Manage existing positions
-        reward += self.manage_positions()
+                reward += 0  # No reward for holding
 
         return reward
 
-    def manage_positions(self):
-        reward = 0
-        positions = mt5.positions_get(symbol=self.symbol)
-        positions = [pos for pos in positions if pos.comment == f"RL Agent {self.timeframe_name}"]
+    def calculate_current_profit(self, position):
+        # Determine the position's current profit
+        if position.type == mt5.ORDER_TYPE_BUY:
+            current_price = mt5.symbol_info_tick(self.symbol).bid
+            current_profit = (current_price - position.price_open) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+        else:  # SELL position
+            current_price = mt5.symbol_info_tick(self.symbol).ask
+            current_profit = (position.price_open - current_price) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
 
-        self.current_profit = 0  # Reset current profit
-
-        for position in positions:
-            # Determine the position's current profit
-            if position.type == mt5.ORDER_TYPE_BUY:
-                current_price = mt5.symbol_info_tick(self.symbol).bid
-                current_profit = (current_price - position.price_open) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
-            else:  # SELL position
-                current_price = mt5.symbol_info_tick(self.symbol).ask
-                current_profit = (position.price_open - current_price) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
-
-            # Accumulate current profit
-            self.current_profit += current_profit
-
-            # Check exit conditions
-            if self.check_exit_conditions(current_profit, position):
-                result = self.close_position(position)
-                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Closed {'Buy' if position.type == mt5.ORDER_TYPE_BUY else 'Sell'} position at {current_price} with profit {position.profit} ({self.timeframe_name})")
-                    reward += position.profit  # Sum up profits from closed positions
-
-        # Provide continuous reward based on current profit
-        reward += self.current_profit
-
-        return reward
+        self.current_profit = current_profit
+        return current_profit
 
     def open_position(self, direction):
         symbol_info = mt5.symbol_info(self.symbol)
@@ -245,15 +234,9 @@ class TradingEnv(gym.Env):
 
         result = mt5.order_send(request)
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            error_message = result.comment.lower()
             logging.error(f"Failed to open position: {result.comment}")
-            if "market closed" in error_message:
-                logging.info(f"Market is closed for {self.symbol}. Pausing trading for this symbol.")
-                self.market_closed = True  # Set the flag to indicate market closure
             return None
 
-        # Reset market closed flag if order is successful
-        self.market_closed = False
         return result
 
     def close_position(self, position):
@@ -305,30 +288,14 @@ class TradingEnv(gym.Env):
             logging.error(f"No acceptable filling mode found for symbol {self.symbol}")
             return None
 
-    def check_exit_conditions(self, current_profit, position):
-        profit_target = 1.0   # At least $1 profit
-        stop_loss = -10.0     # Maximum loss per trade is $10
-
-        # Calculate trade duration
-        position_duration = time.time() - position.time_msc / 1000.0  # Convert from milliseconds to seconds
-        minimum_duration = 60  # 60 seconds; adjust as needed
-
-        if position_duration < minimum_duration:
-            return False
-
-        if current_profit >= profit_target or current_profit <= stop_loss:
-            return True
-        else:
-            return False
-
     def log_market_data(self, obs, action, reward):
         data = {
             'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'Symbol': self.symbol,
             'Timeframe': self.timeframe_name,
             'Price': obs[0],
-            'Action': ['Buy', 'Sell', 'Hold'][action],
-            'Position': self.position,
+            'Action': ['Buy', 'Sell', 'Hold', 'Close'][action],
+            'Position': self.position_type,
             'Current Profit': round(self.current_profit, 2),
             'Reward': round(reward, 2)
         }
@@ -349,9 +316,11 @@ models = {}
 model_paths = {}
 training_start_time = time.time()
 training_duration = 24 * 60 * 60  # Train for 1 day (24 hours)
+save_interval = 60 * 60  # Save models every hour
+last_save_time = training_start_time
 
 for tf in timeframes:
-    envs[tf] = TradingEnv(symbol='BTCUSD', timeframe=tf)
+    envs[tf] = TradingEnv(symbol='BTCUSD', timeframe=tf, lot_size=0.01)
     model_path = f"ppo_model_{tf}.zip"
     model_paths[tf] = model_path
 
@@ -370,6 +339,7 @@ try:
     while True:
         current_time = time.time()
         elapsed_time = current_time - training_start_time
+
         if elapsed_time >= training_duration:
             logging.info("Training duration reached. Saving models and stopping training.")
             # Save the models
@@ -377,13 +347,16 @@ try:
                 models[tf].save(model_paths[tf])
             break  # Exit the loop
 
+        # Save models periodically
+        if current_time - last_save_time >= save_interval:
+            for tf in timeframes:
+                models[tf].save(model_paths[tf])
+            last_save_time = current_time
+            logging.info("Models saved periodically.")
+
         for tf in timeframes:
             env = envs[tf]
-            if env.market_closed:
-                logging.info(f"Market is closed for timeframe {tf}. Skipping.")
-                continue  # Skip this timeframe if market is closed
-
-            action, _states = models[tf].predict(obs[tf], deterministic=True)
+            action, _states = models[tf].predict(obs[tf], deterministic=False)  # Use stochastic policy for exploration
             try:
                 obs[tf], reward, done, info = env.step(action)
             except Exception as e:
