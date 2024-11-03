@@ -72,7 +72,7 @@ class TradingEnv(gym.Env):
         self.initialize_historical_data()
 
         # Update observation space size based on features per timeframe
-        self.num_features_per_tf = 16  # Update based on the actual number of features per timeframe
+        self.num_features_per_tf = 17  # Updated number of features per timeframe
         total_features = self.num_features_per_tf * len(self.timeframes)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(total_features,), dtype=np.float32)
 
@@ -167,11 +167,19 @@ class TradingEnv(gym.Env):
 
             # Additional technical indicators
             macd, macd_signal, macd_hist = ta.MACD(hist_df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-            stochastic_k, stochastic_d = ta.STOCH(hist_df['high'], hist_df['low'], hist_df['close'], fastk_period=14, slowk_period=3, slowd_period=3)
+            stochastic_k, stochastic_d = ta.STOCH(hist_df['high'], hist_df['low'], hist_df['close'],
+                                                  fastk_period=14, slowk_period=3, slowd_period=3)
             atr = ta.ATR(hist_df['high'], hist_df['low'], hist_df['close'], timeperiod=14).iloc[-1]
 
             # Calculate support and resistance levels
             support, resistance = self.calculate_support_resistance(hist_df)
+
+            # Calculate trade duration
+            trade_duration = 0
+            if self.position_type is not None:
+                # Calculate trade duration in minutes
+                position = mt5.positions_get(symbol=self.symbol)[0]
+                trade_duration = (datetime.now() - datetime.fromtimestamp(position.time)).total_seconds() / 60.0
 
             # Append the features to the observation list
             obs.extend([
@@ -190,7 +198,8 @@ class TradingEnv(gym.Env):
                 stochastic_k.iloc[-1],
                 atr,
                 support,
-                resistance
+                resistance,
+                trade_duration  # New feature
             ])
 
         # Convert obs to numpy array
@@ -248,17 +257,33 @@ class TradingEnv(gym.Env):
             # Calculate current profit
             current_profit = self.calculate_current_profit(position)
 
-            # Agent can decide to close the position
-            if action == 3:  # Close Position
+            # Calculate position duration in seconds
+            position_duration = (datetime.now() - datetime.fromtimestamp(position.time)).total_seconds()
+
+            # Check for stop-loss condition
+            if current_profit <= -10:
+                # Close the position due to stop-loss
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Closed position at {result.price} with profit {position.profit}")
-                    reward += current_profit
+                    logging.info(f"Closed position due to stop-loss at {result.price} with loss {position.profit}")
+                    reward -= 10  # Penalize the agent for hitting the stop-loss
                     self.position = None
                     self.position_type = None
+            elif action == 3:  # Close Position
+                if current_profit > 0:
+                    # Allow closing the position only if in profit
+                    result = self.close_position(position)
+                    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logging.info(f"Closed position at {result.price} with profit {position.profit}")
+                        reward += current_profit  # Reward is the profit from the trade
+                        self.position = None
+                        self.position_type = None
+                else:
+                    # Disallow closing the position if not in profit
+                    reward -= 1  # Penalize the agent for attempting to close at a loss
             else:
-                # Provide continuous reward based on current profit
-                reward += current_profit
+                # Encourage holding the trade
+                reward += 0.01  # Small positive reward for holding the trade
         else:
             # No open position
             self.position_type = None
