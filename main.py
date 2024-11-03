@@ -3,11 +3,13 @@ import gym
 from gym import spaces
 import numpy as np
 import talib as ta
-from stable_baselines3 import RecurrentPPO
+import pandas as pd
+from collections import deque
+from sb3_contrib import RecurrentPPO
 import logging
 import time
-import pandas as pd
 import os
+import pickle
 from datetime import datetime
 
 # Initialize logging
@@ -36,19 +38,18 @@ SYMBOL_FILLING_FLAG_IOC = 1 << 1     # 2
 SYMBOL_FILLING_FLAG_RETURN = 1 << 2  # 4
 
 class TradingEnv(gym.Env):
-    def __init__(self, symbol='BTCUSD', timeframe='M1', lot_size=0.01):
+    def __init__(self, symbol='BTCUSD', timeframes=['M1', 'M5', 'M15'], lot_size=0.01, data_file='historical_data.pkl'):
         super(TradingEnv, self).__init__()
 
-        # Set symbol and timeframe
+        # Set symbol and timeframes
         self.symbol = symbol
-        self.timeframe = getattr(mt5, f'TIMEFRAME_{timeframe}')
-        self.timeframe_name = timeframe
+        self.timeframes = timeframes
         self.lot_size = lot_size
+        self.data_file = data_file
 
         # Define action and observation space
         # Actions: 0 = Buy, 1 = Sell, 2 = Hold, 3 = Close Position
         self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32)
 
         # Initialize variables
         self.prev_observation = None
@@ -57,6 +58,8 @@ class TradingEnv(gym.Env):
         self.last_log_time = 0  # For controlling log output frequency
         self.current_profit = 0  # To store current profit
         self.position_type = None  # Track the type of the open position
+        self.step_count = 0  # For periodic saving
+        self.max_data_points = {}  # To store max data points per timeframe
 
         # Initialize account info
         self.account_info = mt5.account_info()
@@ -65,6 +68,50 @@ class TradingEnv(gym.Env):
             mt5.shutdown()
             quit()
 
+        # Initialize historical data storage
+        self.initialize_historical_data()
+
+        # Update observation space size based on features per timeframe
+        self.num_features_per_tf = 16  # Update based on the actual number of features per timeframe
+        total_features = self.num_features_per_tf * len(self.timeframes)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(total_features,), dtype=np.float32)
+
+    def calculate_max_data_points(self, timeframe):
+        # Calculate the number of data points for 24 hours
+        if timeframe == 'M1':
+            data_points = 60 * 24  # 1 data point per minute
+        elif timeframe == 'M5':
+            data_points = 12 * 24  # 1 data point every 5 minutes
+        elif timeframe == 'M15':
+            data_points = 4 * 24   # 1 data point every 15 minutes
+        else:
+            # Default to 1,440 data points (assumes M1)
+            data_points = 60 * 24
+        return data_points
+
+    def initialize_historical_data(self):
+        # Initialize historical data for each timeframe
+        self.historical_data = {}
+        for tf in self.timeframes:
+            self.max_data_points[tf] = self.calculate_max_data_points(tf)
+            data_file_tf = f"{self.data_file}_{tf}"
+            if os.path.exists(data_file_tf):
+                with open(data_file_tf, 'rb') as f:
+                    self.historical_data[tf] = pickle.load(f)
+                logging.info(f"Loaded historical data for timeframe {tf} from {data_file_tf}")
+            else:
+                # Initialize empty deque with maxlen
+                self.historical_data[tf] = deque(maxlen=self.max_data_points[tf])
+                logging.info(f"Initialized empty historical data for timeframe {tf}")
+
+    def save_historical_data(self):
+        # Save historical data to file for each timeframe
+        for tf in self.timeframes:
+            data_file_tf = f"{self.data_file}_{tf}"
+            with open(data_file_tf, 'wb') as f:
+                pickle.dump(self.historical_data[tf], f)
+            logging.info(f"Saved historical data for timeframe {tf} to {data_file_tf}")
+
     def reset(self):
         self.prev_observation = None
         self.position = None  # Reset position to None
@@ -72,50 +119,85 @@ class TradingEnv(gym.Env):
         self.last_log_time = 0  # Reset log timer
         self.current_profit = 0  # Reset profit
         self.position_type = None  # Reset position type
-        logging.info(f"Environment reset for timeframe {self.timeframe_name}")
-        return np.zeros(11, dtype=np.float32)
+        self.step_count = 0  # Reset step count
+        # Historical data is already loaded during initialization
+        logging.info("Environment reset")
+        return np.zeros(self.observation_space.shape, dtype=np.float32)
 
     def step(self, action):
-        # Retrieve market data
-        rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, 500)
+        obs = []
+        for tf in self.timeframes:
+            timeframe_mt5 = getattr(mt5, f'TIMEFRAME_{tf}')
+            # Retrieve market data for the timeframe
+            rates = mt5.copy_rates_from_pos(self.symbol, timeframe_mt5, 0, 500)
 
-        if rates is None or len(rates) == 0:
-            logging.error("No market data retrieved")
-            time.sleep(60)  # Wait before retrying
-            return np.zeros(11), 0, False, {}
+            if rates is None or len(rates) == 0:
+                logging.error(f"No market data retrieved for timeframe {tf}")
+                time.sleep(60)  # Wait before retrying
+                return np.zeros(self.observation_space.shape), 0, False, {}
 
-        # Prepare data
-        close_prices = rates['close'].astype(np.float64)
-        high_prices = rates['high'].astype(np.float64)
-        low_prices = rates['low'].astype(np.float64)
-        volume = rates['tick_volume'].astype(np.float64)
+            # Prepare data
+            close_prices = rates['close'].astype(np.float64)
+            high_prices = rates['high'].astype(np.float64)
+            low_prices = rates['low'].astype(np.float64)
+            volume = rates['tick_volume'].astype(np.float64)
+            times = rates['time']
 
-        # Calculate technical indicators
-        ema50 = ta.EMA(close_prices, timeperiod=50)[-1]
-        rsi = ta.RSI(close_prices, timeperiod=14)[-1]
-        adx = ta.ADX(high_prices, low_prices, close_prices, timeperiod=14)[-1]
-        volatility = np.std(close_prices[-20:])
-        supertrend = self.calculate_supertrend(high_prices, low_prices, close_prices)
+            # Update historical data
+            for i in range(len(close_prices)):
+                self.historical_data[tf].append({
+                    'time': times[i],
+                    'close': close_prices[i],
+                    'high': high_prices[i],
+                    'low': low_prices[i],
+                    'volume': volume[i]
+                })
 
-        current_price = close_prices[-1]
+            # Convert historical data to DataFrame for processing
+            hist_df = pd.DataFrame(list(self.historical_data[tf]))
 
-        # Observation
-        obs = np.array([
-            current_price,        # Latest close price
-            ema50,
-            rsi,
-            adx,
-            supertrend,
-            np.min(close_prices[-50:]),
-            np.max(close_prices[-50:]),
-            np.mean(close_prices[-50:]),
-            np.std(close_prices[-50:]),
-            volume[-1],
-            volatility
-        ], dtype=np.float32)
+            # Calculate technical indicators using historical data
+            ema50 = ta.EMA(hist_df['close'], timeperiod=50).iloc[-1]
+            rsi = ta.RSI(hist_df['close'], timeperiod=14).iloc[-1]
+            adx = ta.ADX(hist_df['high'], hist_df['low'], hist_df['close'], timeperiod=14).iloc[-1]
+            volatility = hist_df['close'].rolling(window=20).std().iloc[-1]
+            supertrend = self.calculate_supertrend(hist_df['high'], hist_df['low'], hist_df['close'])
+
+            current_price = hist_df['close'].iloc[-1]
+
+            # Additional technical indicators
+            macd, macd_signal, macd_hist = ta.MACD(hist_df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+            stochastic_k, stochastic_d = ta.STOCH(hist_df['high'], hist_df['low'], hist_df['close'], fastk_period=14, slowk_period=3, slowd_period=3)
+            atr = ta.ATR(hist_df['high'], hist_df['low'], hist_df['close'], timeperiod=14).iloc[-1]
+
+            # Calculate support and resistance levels
+            support, resistance = self.calculate_support_resistance(hist_df)
+
+            # Append the features to the observation list
+            obs.extend([
+                current_price,
+                ema50,
+                rsi,
+                adx,
+                supertrend,
+                hist_df['close'].min(),
+                hist_df['close'].max(),
+                hist_df['close'].mean(),
+                hist_df['close'].std(),
+                hist_df['volume'].iloc[-1],
+                volatility,
+                macd.iloc[-1],
+                stochastic_k.iloc[-1],
+                atr,
+                support,
+                resistance
+            ])
+
+        # Convert obs to numpy array
+        obs = np.array(obs, dtype=np.float32)
 
         # Execute action and calculate reward
-        reward = self.execute_trade(action, current_price)
+        reward = self.execute_trade(action)
 
         # Log current market price and action every 10 seconds
         current_time = time.time()
@@ -130,22 +212,32 @@ class TradingEnv(gym.Env):
 
         self.prev_observation = obs
 
+        # Increment step count and save historical data periodically
+        self.step_count += 1
+        if self.step_count % 10 == 0:
+            self.save_historical_data()
+
         return obs, reward, done, info
 
+    def calculate_support_resistance(self, hist_df):
+        # Simple support and resistance calculation using pivots
+        pivot = (hist_df['high'].iloc[-1] + hist_df['low'].iloc[-1] + hist_df['close'].iloc[-1]) / 3
+        support = (2 * pivot) - hist_df['high'].iloc[-1]
+        resistance = (2 * pivot) - hist_df['low'].iloc[-1]
+        return support, resistance
+
     def calculate_supertrend(self, high, low, close):
-        # Implement SuperTrend calculation or use a library function
-        # Placeholder implementation
-        if close[-1] > ta.SMA(close, timeperiod=10)[-1]:
+        # Placeholder implementation for SuperTrend
+        if close.iloc[-1] > ta.SMA(close, timeperiod=10).iloc[-1]:
             return 1  # Bullish
         else:
             return -1  # Bearish
 
-    def execute_trade(self, action, current_price):
+    def execute_trade(self, action):
         reward = 0
 
-        # Get positions for this symbol and timeframe
-        all_positions = mt5.positions_get(symbol=self.symbol)
-        positions = [pos for pos in all_positions if pos.comment == f"RL Agent {self.timeframe_name}"]
+        # Get positions for this symbol
+        positions = mt5.positions_get(symbol=self.symbol)
         positions_count = len(positions)
 
         if positions_count > 0:
@@ -160,8 +252,8 @@ class TradingEnv(gym.Env):
             if action == 3:  # Close Position
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Closed position at {current_price} with profit {position.profit} ({self.timeframe_name})")
-                    reward += current_profit  # Reward is the profit from the trade
+                    logging.info(f"Closed position at {result.price} with profit {position.profit}")
+                    reward += current_profit
                     self.position = None
                     self.position_type = None
             else:
@@ -173,13 +265,13 @@ class TradingEnv(gym.Env):
             if action == 0:  # Buy
                 result = self.open_position('BUY')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Opened Buy position at {result.price} on {self.symbol} ({self.timeframe_name})")
+                    logging.info(f"Opened Buy position at {result.price} on {self.symbol}")
                     self.position = 'buy'
                     self.position_type = 'buy'
             elif action == 1:  # Sell
                 result = self.open_position('SELL')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Opened Sell position at {result.price} on {self.symbol} ({self.timeframe_name})")
+                    logging.info(f"Opened Sell position at {result.price} on {self.symbol}")
                     self.position = 'sell'
                     self.position_type = 'sell'
             else:
@@ -227,7 +319,7 @@ class TradingEnv(gym.Env):
             "price": price,
             "deviation": 10,
             "magic": 234000,
-            "comment": f"RL Agent {self.timeframe_name}",
+            "comment": f"RL Agent",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_type,
         }
@@ -262,7 +354,7 @@ class TradingEnv(gym.Env):
             "price": price,
             "deviation": 10,
             "magic": 234000,
-            "comment": f"RL Agent Close {self.timeframe_name}",
+            "comment": f"RL Agent Close",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": filling_type,
         }
@@ -292,7 +384,6 @@ class TradingEnv(gym.Env):
         data = {
             'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'Symbol': self.symbol,
-            'Timeframe': self.timeframe_name,
             'Price': obs[0],
             'Action': ['Buy', 'Sell', 'Hold', 'Close'][action],
             'Position': self.position_type,
@@ -300,7 +391,7 @@ class TradingEnv(gym.Env):
             'Reward': round(reward, 2)
         }
         # Print as a single line without headers
-        output = f"{data['Time']} | {data['Symbol']} | TF: {data['Timeframe']} | Price: {data['Price']:.2f} | Action: {data['Action']} | Position: {data['Position']} | Profit: {data['Current Profit']:.2f} | Reward: {data['Reward']:.2f}"
+        output = f"{data['Time']} | {data['Symbol']} | Price: {data['Price']:.2f} | Action: {data['Action']} | Position: {data['Position']} | Profit: {data['Current Profit']:.2f} | Reward: {data['Reward']:.2f}"
         print(output)
 
     def render(self, mode='human'):
@@ -309,92 +400,77 @@ class TradingEnv(gym.Env):
     def close(self):
         pass
 
-# Initialize environments and agents for multiple timeframes
-timeframes = ['M1', 'M5', 'M15']
-envs = {}
-models = {}
-model_paths = {}
-training_start_time = time.time()
-training_duration = 24 * 60 * 60  # Train for 1 day (24 hours)
-save_interval = 60 * 60  # Save models every hour
-last_save_time = training_start_time
-
-for tf in timeframes:
-    envs[tf] = TradingEnv(symbol='BTCUSD', timeframe=tf, lot_size=0.01)
-    model_path = f"recurrent_ppo_model_{tf}.zip"
-    model_paths[tf] = model_path
+# Main script
+if __name__ == "__main__":
+    # Initialize the environment
+    env = TradingEnv(symbol='BTCUSD', timeframes=['M1', 'M5', 'M15'], lot_size=0.01, data_file='historical_data.pkl')
+    model_path = "recurrent_ppo_model.zip"
+    training_start_time = time.time()
+    training_duration = 24 * 60 * 60  # Train for 1 day (24 hours)
+    save_interval = 60 * 60  # Save model every hour
+    last_save_time = training_start_time
 
     if os.path.exists(model_path):
         # Load the existing model
-        models[tf] = RecurrentPPO.load(model_path, env=envs[tf])
-        logging.info(f"Loaded existing model for timeframe {tf}")
+        model = RecurrentPPO.load(model_path, env=env)
+        logging.info("Loaded existing model")
     else:
         # Create a new model with LSTM policy
-        models[tf] = RecurrentPPO('MlpLstmPolicy', envs[tf], verbose=0)
-        logging.info(f"Created new RecurrentPPO model for timeframe {tf}")
+        model = RecurrentPPO('MlpLstmPolicy', env, verbose=0)
+        logging.info("Created new RecurrentPPO model")
 
-# Live trading loop
-try:
-    obs = {tf: envs[tf].reset() for tf in timeframes}
-    lstm_states = {tf: None for tf in timeframes}  # Initialize LSTM states
-    episode_starts = {tf: True for tf in timeframes}  # Track the start of episodes
+    # Live trading loop
+    try:
+        obs = env.reset()
+        lstm_state = None  # Initialize LSTM state
+        episode_start = True  # Track the start of episodes
 
-    while True:
-        current_time = time.time()
-        elapsed_time = current_time - training_start_time
+        while True:
+            current_time = time.time()
+            elapsed_time = current_time - training_start_time
 
-        if elapsed_time >= training_duration:
-            logging.info("Training duration reached. Saving models and stopping training.")
-            # Save the models
-            for tf in timeframes:
-                models[tf].save(model_paths[tf])
-            break  # Exit the loop
+            if elapsed_time >= training_duration:
+                logging.info("Training duration reached. Saving model and stopping training.")
+                model.save(model_path)
+                break  # Exit the loop
 
-        # Save models periodically
-        if current_time - last_save_time >= save_interval:
-            for tf in timeframes:
-                models[tf].save(model_paths[tf])
-            last_save_time = current_time
-            logging.info("Models saved periodically.")
+            # Save model periodically
+            if current_time - last_save_time >= save_interval:
+                model.save(model_path)
+                last_save_time = current_time
+                logging.info("Model saved periodically.")
 
-        for tf in timeframes:
-            env = envs[tf]
             # Get the previous LSTM state and episode start
-            lstm_state = lstm_states[tf]
-            episode_start = episode_starts[tf]
-
-            action, lstm_states[tf] = models[tf].predict(obs[tf], state=lstm_state, episode_start=episode_start, deterministic=False)
-            episode_starts[tf] = False  # After the first step, episode has started
+            action, lstm_state = model.predict(obs, state=lstm_state, episode_start=episode_start, deterministic=False)
+            episode_start = False  # After the first step, episode has started
 
             try:
-                obs[tf], reward, done, info = env.step(action)
+                obs, reward, done, info = env.step(action)
             except Exception as e:
-                logging.error(f"Error in timeframe {tf}: {e}")
-                # Sleep to prevent flooding and retry after some time
+                logging.error(f"Error in environment: {e}")
                 time.sleep(60)
-                continue  # Skip to the next timeframe
+                continue  # Skip to the next iteration
 
             if reward != 0:
-                # Train the model with the obtained reward
-                # Note: For RecurrentPPO, we typically collect rollouts and train periodically
+                # Collect rollouts and perform training updates periodically
                 pass  # In live trading, immediate training may not be feasible
 
-            # If done, reset the environment and LSTM states
+            # If done, reset the environment and LSTM state
             if done:
-                obs[tf] = env.reset()
-                lstm_states[tf] = None
-                episode_starts[tf] = True
+                obs = env.reset()
+                lstm_state = None
+                episode_start = True
 
             # Sleep for a short time to limit the rate of requests
             time.sleep(1)
 
-except KeyboardInterrupt:
-    logging.info("Interrupted by user")
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user")
 
-finally:
-    # Save models before exiting
-    for tf in timeframes:
-        models[tf].save(model_paths[tf])
-        envs[tf].close()
-    mt5.shutdown()
-    logging.info("Trading session ended")
+    finally:
+        # Save model and historical data before exiting
+        model.save(model_path)
+        env.save_historical_data()
+        env.close()
+        mt5.shutdown()
+        logging.info("Trading session ended")
