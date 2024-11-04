@@ -13,8 +13,8 @@ import pickle
 from datetime import datetime, timedelta
 import glob
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Initialize logging with reduced verbosity
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # Initialize MetaTrader5
 if not mt5.initialize():
@@ -22,9 +22,9 @@ if not mt5.initialize():
     quit()
 
 # Login to MetaTrader5 with credentials
-login = 62061021  # Replace with your account number
+login = 12345678  # Replace with your account number
 password = 'your_password'  # Replace with your password
-server = 'PepperstoneUK-Demo'  # Replace with your server name
+server = 'YourBroker-Server'  # Replace with your server name
 
 if not mt5.login(login, password=password, server=server):
     logging.error(f"Failed to login to MetaTrader5, error: {mt5.last_error()}")
@@ -68,6 +68,9 @@ class TradingEnv(gym.Env):
             logging.error("Failed to get account info")
             mt5.shutdown()
             quit()
+
+        # Store the initial account balance
+        self.initial_balance = self.account_info.balance
 
         # Initialize historical data storage
         self.initialize_historical_data()
@@ -119,7 +122,6 @@ class TradingEnv(gym.Env):
     def delete_old_data(self, days_to_keep=15):
         # Delete historical data files older than days_to_keep days
         cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-        cutoff_timestamp = cutoff_date.timestamp()
         for file in glob.glob(f"{self.data_file_prefix}_*"):
             # Extract date from filename
             date_part = file.split('_')[-1].replace('.pkl', '')
@@ -239,31 +241,23 @@ class TradingEnv(gym.Env):
 
         # Modify action based on whether a position is open
         if positions_count > 0:
-            # There is an open position
+            # Position is open; limit actions to "Close" or "Hold"
             if action in [0, 1]:
                 # Ignore Buy or Sell actions when position is open
                 action = 2  # Set action to Hold
             # Execute action and calculate reward
             reward = self.execute_trade(action)
         else:
-            # No open position
-            if action in [3]:
+            # No position is open; actions "Buy" or "Sell" are valid
+            if action == 3:
                 # Cannot close a position when none is open
                 action = 2  # Set action to Hold
             # Execute action and calculate reward
             reward = self.execute_trade(action)
 
-        # Log current market price and action every 10 seconds
-        current_time = time.time()
-        if current_time - self.last_log_time >= 10:
-            self.log_market_data(obs, action, reward)
-            self.last_log_time = current_time
-
         # Check if done (we'll keep it always False for live trading)
         done = False
-
         info = {}
-
         self.prev_observation = obs
 
         # Increment step count and save historical data periodically
@@ -300,6 +294,7 @@ class TradingEnv(gym.Env):
 
     def execute_trade(self, action):
         reward = 0
+        log_disallowed_action = False  # Set to True to enable logging disallowed actions
 
         # Get positions for this symbol
         positions = mt5.positions_get(symbol=self.symbol)
@@ -317,7 +312,8 @@ class TradingEnv(gym.Env):
             if current_profit <= -3:
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Closed position due to stop-loss at {result.price} with loss {position.profit}")
+                    # Log the trade closure
+                    self.log_trade('Stop-Loss', position, current_profit)
                     reward += current_profit  # Negative reward
                     self.position = None
                     self.position_type = None
@@ -326,7 +322,8 @@ class TradingEnv(gym.Env):
             elif current_profit >= 0.5:
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Closed position due to take-profit at {result.price} with profit {position.profit}")
+                    # Log the trade closure
+                    self.log_trade('Take-Profit', position, current_profit)
                     reward += current_profit  # Positive reward
                     self.position = None
                     self.position_type = None
@@ -336,13 +333,15 @@ class TradingEnv(gym.Env):
                     # Allow closing the position only if in profit
                     result = self.close_position(position)
                     if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                        logging.info(f"Closed position at {result.price} with profit {position.profit}")
+                        # Log the trade closure
+                        self.log_trade('Manual Close', position, current_profit)
                         reward += current_profit
                         self.position = None
                         self.position_type = None
                 else:
                     # Disallow closing at a loss
-                    logging.info("Attempted to close at a loss, action disallowed")
+                    if log_disallowed_action:
+                        logging.warning("Attempted to close at a loss, action disallowed")
                     reward -= 1  # Penalize the agent
             else:
                 # Hold position
@@ -353,13 +352,15 @@ class TradingEnv(gym.Env):
             if action == 0:  # Buy
                 result = self.open_position('BUY')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Opened Buy position at {result.price} on {self.symbol}")
+                    # Log the trade opening
+                    self.log_trade('Open Buy', result, 0)
                     self.position = 'buy'
                     self.position_type = 'buy'
             elif action == 1:  # Sell
                 result = self.open_position('SELL')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Opened Sell position at {result.price} on {self.symbol}")
+                    # Log the trade opening
+                    self.log_trade('Open Sell', result, 0)
                     self.position = 'sell'
                     self.position_type = 'sell'
             else:
@@ -468,18 +469,15 @@ class TradingEnv(gym.Env):
             logging.error(f"No acceptable filling mode found for symbol {self.symbol}")
             return None
 
-    def log_market_data(self, obs, action, reward):
-        data = {
-            'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'Symbol': self.symbol,
-            'Price': obs[0],
-            'Action': ['Buy', 'Sell', 'Hold', 'Close'][action],
-            'Position': self.position_type,
-            'Current Profit': round(self.current_profit, 2),
-            'Reward': round(reward, 2)
-        }
-        # Print as a single line without headers
-        output = f"{data['Time']} | {data['Symbol']} | Price: {data['Price']:.2f} | Action: {data['Action']} | Position: {data['Position']} | Profit: {data['Current Profit']:.2f} | Reward: {data['Reward']:.2f}"
+    def log_trade(self, event_type, position, profit):
+        # Calculate account balance growth
+        current_balance = mt5.account_info().balance
+        balance_change = current_balance - self.initial_balance
+
+        # Log the trade event
+        output = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Event: {event_type} | Symbol: {self.symbol} | " \
+                 f"Position: {self.position_type} | Profit: {profit:.2f} | Account Balance: {current_balance:.2f} | " \
+                 f"Balance Change: {balance_change:.2f}"
         print(output)
 
     def render(self, mode='human'):
