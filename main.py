@@ -257,33 +257,26 @@ class TradingEnv(gym.Env):
             # Calculate current profit
             current_profit = self.calculate_current_profit(position)
 
-            # Calculate position duration in seconds
-            position_duration = (datetime.now() - datetime.fromtimestamp(position.time)).total_seconds()
-
             # Check for stop-loss condition
-            if current_profit <= -10:
+            if current_profit <= -2:
                 # Close the position due to stop-loss
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logging.info(f"Closed position due to stop-loss at {result.price} with loss {position.profit}")
-                    reward -= 10  # Penalize the agent for hitting the stop-loss
+                    reward += current_profit  # Reward is the negative profit (loss)
                     self.position = None
                     self.position_type = None
             elif action == 3:  # Close Position
-                if current_profit > 0:
-                    # Allow closing the position only if in profit
-                    result = self.close_position(position)
-                    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                        logging.info(f"Closed position at {result.price} with profit {position.profit}")
-                        reward += current_profit  # Reward is the profit from the trade
-                        self.position = None
-                        self.position_type = None
-                else:
-                    # Disallow closing the position if not in profit
-                    reward -= 1  # Penalize the agent for attempting to close at a loss
+                # Close the position
+                result = self.close_position(position)
+                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logging.info(f"Closed position at {result.price} with profit {position.profit}")
+                    reward += current_profit  # Reward is the profit (could be positive or negative)
+                    self.position = None
+                    self.position_type = None
             else:
-                # Encourage holding the trade
-                reward += 0.01  # Small positive reward for holding the trade
+                # Hold position
+                reward += 0  # No reward for holding the position
         else:
             # No open position
             self.position_type = None
@@ -300,7 +293,7 @@ class TradingEnv(gym.Env):
                     self.position = 'sell'
                     self.position_type = 'sell'
             else:
-                # Hold
+                # Hold / No action
                 self.position = None
                 reward += 0  # No reward for holding
 
