@@ -81,6 +81,19 @@ class TradingEnv(gym.Env):
         total_features = (self.num_features_per_tf * len(self.timeframes)) + self.num_additional_features
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(total_features,), dtype=np.float32)
 
+        # Initialize moving stop-loss levels
+        self.stop_loss_levels = [
+            {'profit_threshold': 0.5, 'stop_loss': 0.1},
+            {'profit_threshold': 1.0, 'stop_loss': 0.5},
+            {'profit_threshold': 4.0, 'stop_loss': 2.0},
+            {'profit_threshold': 10.0, 'stop_loss': 5.0},
+            {'profit_threshold': 20.0, 'stop_loss': 10.0},
+            {'profit_threshold': 30.0, 'stop_loss': 20.0},
+            {'profit_threshold': 40.0, 'stop_loss': 30.0},
+            # Add more levels if needed
+        ]
+        self.current_stop_loss = None  # Track the current stop-loss level
+
     def calculate_max_data_points(self, timeframe):
         # Calculate the number of data points for 24 hours
         if timeframe == 'M1':
@@ -142,6 +155,7 @@ class TradingEnv(gym.Env):
         self.current_profit = 0  # Reset profit
         self.position_type = None  # Reset position type
         self.step_count = 0  # Reset step count
+        self.current_stop_loss = None  # Reset stop-loss level
         # Historical data is already loaded during initialization
         logging.info("Environment reset")
         return np.zeros(self.observation_space.shape, dtype=np.float32)
@@ -308,47 +322,38 @@ class TradingEnv(gym.Env):
             # Calculate current profit
             current_profit = self.calculate_current_profit(position)
 
-            # Stop-Loss at -$3
+            # Update stop-loss based on profit milestones
+            self.update_stop_loss(position, current_profit)
+
+            # Check if stop-loss has been hit
             if current_profit <= -3:
+                # Stop-Loss at -$3
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     # Log the trade closure
-                    self.log_trade('Stop-Loss', position, current_profit)
+                    self.log_trade('Stop-Loss Hit', position, current_profit)
                     reward += current_profit  # Negative reward
                     self.position = None
                     self.position_type = None
+                    self.current_stop_loss = None  # Reset stop-loss level
 
-            # Take-Profit at $0.50
-            elif current_profit >= 0.5:
+            elif action == 3:  # Close Position
+                # Allow the bot to decide when to close the position
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     # Log the trade closure
-                    self.log_trade('Take-Profit', position, current_profit)
-                    reward += current_profit  # Positive reward
+                    self.log_trade('Manual Close', position, current_profit)
+                    reward += current_profit
                     self.position = None
                     self.position_type = None
-
-            elif action == 3:  # Close Position
-                if current_profit > 0:
-                    # Allow closing the position only if in profit
-                    result = self.close_position(position)
-                    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                        # Log the trade closure
-                        self.log_trade('Manual Close', position, current_profit)
-                        reward += current_profit
-                        self.position = None
-                        self.position_type = None
-                else:
-                    # Disallow closing at a loss
-                    if log_disallowed_action:
-                        logging.warning("Attempted to close at a loss, action disallowed")
-                    reward -= 1  # Penalize the agent
+                    self.current_stop_loss = None  # Reset stop-loss level
             else:
                 # Hold position
                 reward += 0  # No reward
         else:
             # No open position
             self.position_type = None
+            self.current_stop_loss = None  # Reset stop-loss level
             if action == 0:  # Buy
                 result = self.open_position('BUY')
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -370,17 +375,83 @@ class TradingEnv(gym.Env):
 
         return reward
 
+    def update_stop_loss(self, position, current_profit):
+        # Update the stop-loss level based on the profit milestones
+        for level in self.stop_loss_levels:
+            if current_profit >= level['profit_threshold']:
+                if self.current_stop_loss is None or level['stop_loss'] > self.current_stop_loss:
+                    self.current_stop_loss = level['stop_loss']
+                    self.modify_position_stop_loss(position, self.current_stop_loss)
+                    # Log the stop-loss update
+                    self.log_trade(f"Stop-Loss Updated to {self.current_stop_loss}", position, current_profit)
+            else:
+                break  # Break if current profit is less than the threshold
+
+    def modify_position_stop_loss(self, position, stop_loss_amount):
+        # Modify the stop-loss of an existing position
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info is None:
+            logging.error(f"{self.symbol} not found")
+            return None
+
+        contract_size = symbol_info.trade_contract_size
+
+        # Calculate the new stop-loss price
+        if position.type == mt5.ORDER_TYPE_BUY:
+            new_stop_loss_price = position.price_open + (stop_loss_amount - self.current_stop_loss) / (position.volume * contract_size)
+        else:  # SELL position
+            new_stop_loss_price = position.price_open - (stop_loss_amount - self.current_stop_loss) / (position.volume * contract_size)
+
+        # Prepare the request
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": self.symbol,
+            "position": position.ticket,
+            "sl": new_stop_loss_price,
+            "tp": position.tp,  # Keep existing take-profit if any
+            "magic": 234000,
+            "comment": f"RL Agent Stop-Loss Update",
+        }
+
+        # Send the request
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logging.error(f"Failed to modify stop-loss: {result.comment}")
+        return result
+
     def calculate_current_profit(self, position):
-        # Determine the position's current profit
+        # Determine the position's current profit in dollars
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info is None:
+            logging.error(f"{self.symbol} not found")
+            return 0
+
+        contract_size = symbol_info.trade_contract_size
+
+        # Get current price
         if position.type == mt5.ORDER_TYPE_BUY:
             current_price = mt5.symbol_info_tick(self.symbol).bid
-            current_profit = (current_price - position.price_open) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+            price_diff = current_price - position.price_open
         else:  # SELL position
             current_price = mt5.symbol_info_tick(self.symbol).ask
-            current_profit = (position.price_open - current_price) * position.volume * mt5.symbol_info(self.symbol).trade_contract_size
+            price_diff = position.price_open - current_price
 
-        self.current_profit = current_profit
-        return current_profit
+        # Calculate profit
+        profit = price_diff * position.volume * contract_size
+
+        # Convert profit to account currency if necessary
+        if symbol_info.currency_profit != self.account_info.currency:
+            conversion_symbol = symbol_info.currency_profit + self.account_info.currency
+            conversion_info = mt5.symbol_info(conversion_symbol)
+            if conversion_info is not None:
+                conversion_rate = mt5.symbol_info_tick(conversion_symbol).bid
+                profit *= conversion_rate
+            else:
+                logging.error(f"Failed to get conversion rate for {symbol_info.currency_profit} to {self.account_info.currency}")
+                return 0
+
+        self.current_profit = profit
+        return profit
 
     def open_position(self, direction):
         symbol_info = mt5.symbol_info(self.symbol)
