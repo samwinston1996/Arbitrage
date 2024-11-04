@@ -72,8 +72,9 @@ class TradingEnv(gym.Env):
         self.initialize_historical_data()
 
         # Update observation space size based on features per timeframe
-        self.num_features_per_tf = 17  # Updated number of features per timeframe
-        total_features = self.num_features_per_tf * len(self.timeframes)
+        self.num_features_per_tf = 17  # Existing features per timeframe
+        self.num_additional_features = 1  # Account balance
+        total_features = (self.num_features_per_tf * len(self.timeframes)) + self.num_additional_features
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(total_features,), dtype=np.float32)
 
     def calculate_max_data_points(self, timeframe):
@@ -202,6 +203,14 @@ class TradingEnv(gym.Env):
                 trade_duration  # New feature
             ])
 
+            # Save data for analysis
+            self.save_analysis_data(tf, hist_df)
+
+        # Include account balance in the observation
+        self.account_info = mt5.account_info()  # Update account info
+        account_balance = self.account_info.balance
+        obs.append(account_balance)
+
         # Convert obs to numpy array
         obs = np.array(obs, dtype=np.float32)
 
@@ -227,6 +236,14 @@ class TradingEnv(gym.Env):
             self.save_historical_data()
 
         return obs, reward, done, info
+
+    def save_analysis_data(self, timeframe, hist_df):
+        data_file = f"analysis_data_{timeframe}.csv"
+        hist_df['timeframe'] = timeframe  # Add timeframe column
+        if not os.path.exists(data_file):
+            hist_df.to_csv(data_file, index=False)
+        else:
+            hist_df.to_csv(data_file, mode='a', header=False, index=False)
 
     def calculate_support_resistance(self, hist_df):
         # Simple support and resistance calculation using pivots
@@ -257,26 +274,40 @@ class TradingEnv(gym.Env):
             # Calculate current profit
             current_profit = self.calculate_current_profit(position)
 
-            # Check for stop-loss condition
-            if current_profit <= -2:
-                # Close the position due to stop-loss
+            # Stop-Loss at -$3
+            if current_profit <= -3:
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                     logging.info(f"Closed position due to stop-loss at {result.price} with loss {position.profit}")
-                    reward += current_profit  # Reward is the negative profit (loss)
+                    reward += current_profit  # Negative reward
                     self.position = None
                     self.position_type = None
-            elif action == 3:  # Close Position
-                # Close the position
+
+            # Take-Profit at $0.50
+            elif current_profit >= 0.5:
                 result = self.close_position(position)
                 if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logging.info(f"Closed position at {result.price} with profit {position.profit}")
-                    reward += current_profit  # Reward is the profit (could be positive or negative)
+                    logging.info(f"Closed position due to take-profit at {result.price} with profit {position.profit}")
+                    reward += current_profit  # Positive reward
                     self.position = None
                     self.position_type = None
+
+            elif action == 3:  # Close Position
+                if current_profit > 0:
+                    # Allow closing the position only if in profit
+                    result = self.close_position(position)
+                    if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                        logging.info(f"Closed position at {result.price} with profit {position.profit}")
+                        reward += current_profit
+                        self.position = None
+                        self.position_type = None
+                else:
+                    # Disallow closing at a loss
+                    logging.info("Attempted to close at a loss, action disallowed")
+                    reward -= 1  # Penalize the agent
             else:
                 # Hold position
-                reward += 0  # No reward for holding the position
+                reward += 0  # No reward
         else:
             # No open position
             self.position_type = None
@@ -295,7 +326,7 @@ class TradingEnv(gym.Env):
             else:
                 # Hold / No action
                 self.position = None
-                reward += 0  # No reward for holding
+                reward += 0  # No reward
 
         return reward
 
@@ -418,6 +449,28 @@ class TradingEnv(gym.Env):
     def close(self):
         pass
 
+    def analyze_historical_data(self):
+        # Combine data from all timeframes
+        combined_data = pd.DataFrame()
+        for tf in self.timeframes:
+            data_file = f"analysis_data_{tf}.csv"
+            if os.path.exists(data_file):
+                df = pd.read_csv(data_file)
+                combined_data = pd.concat([combined_data, df], ignore_index=True)
+
+        # Perform analysis to determine optimized levels
+        # Placeholder for analysis logic
+        # Example: Calculate average profitable trade size, loss size, etc.
+        # You can implement advanced analysis or machine learning models here
+
+        # For demonstration, set example optimized levels
+        optimized_take_profit = 0.7  # Example value
+        optimized_stop_loss = -2.5   # Example value
+
+        # Output the optimized levels
+        print(f"Optimized Take-Profit: ${optimized_take_profit:.2f}")
+        print(f"Optimized Stop-Loss: ${optimized_stop_loss:.2f}")
+
 # Main script
 if __name__ == "__main__":
     # Initialize the environment
@@ -450,6 +503,7 @@ if __name__ == "__main__":
             if elapsed_time >= training_duration:
                 logging.info("Training duration reached. Saving model and stopping training.")
                 model.save(model_path)
+                env.analyze_historical_data()
                 break  # Exit the loop
 
             # Save model periodically
