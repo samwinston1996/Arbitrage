@@ -10,7 +10,8 @@ import logging
 import time
 import os
 import pickle
-from datetime import datetime
+from datetime import datetime, timedelta
+import glob
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -38,14 +39,14 @@ SYMBOL_FILLING_FLAG_IOC = 1 << 1     # 2
 SYMBOL_FILLING_FLAG_RETURN = 1 << 2  # 4
 
 class TradingEnv(gym.Env):
-    def __init__(self, symbol='BTCUSD', timeframes=['M1', 'M5', 'M15'], lot_size=0.01, data_file='historical_data.pkl'):
+    def __init__(self, symbol='BTCUSD', timeframes=['M1', 'M5', 'M15'], lot_size=0.01, data_file_prefix='historical_data'):
         super(TradingEnv, self).__init__()
 
         # Set symbol and timeframes
         self.symbol = symbol
         self.timeframes = timeframes
         self.lot_size = lot_size
-        self.data_file = data_file
+        self.data_file_prefix = data_file_prefix
 
         # Define action and observation space
         # Actions: 0 = Buy, 1 = Sell, 2 = Hold, 3 = Close Position
@@ -93,9 +94,10 @@ class TradingEnv(gym.Env):
     def initialize_historical_data(self):
         # Initialize historical data for each timeframe
         self.historical_data = {}
+        current_date = datetime.now().strftime('%Y%m%d')
         for tf in self.timeframes:
             self.max_data_points[tf] = self.calculate_max_data_points(tf)
-            data_file_tf = f"{self.data_file}_{tf}"
+            data_file_tf = f"{self.data_file_prefix}_{tf}_{current_date}.pkl"
             if os.path.exists(data_file_tf):
                 with open(data_file_tf, 'rb') as f:
                     self.historical_data[tf] = pickle.load(f)
@@ -106,12 +108,29 @@ class TradingEnv(gym.Env):
                 logging.info(f"Initialized empty historical data for timeframe {tf}")
 
     def save_historical_data(self):
-        # Save historical data to file for each timeframe
+        # Save historical data to file for each timeframe with date-based filenames
+        current_date = datetime.now().strftime('%Y%m%d')
         for tf in self.timeframes:
-            data_file_tf = f"{self.data_file}_{tf}"
+            data_file_tf = f"{self.data_file_prefix}_{tf}_{current_date}.pkl"
             with open(data_file_tf, 'wb') as f:
                 pickle.dump(self.historical_data[tf], f)
             logging.info(f"Saved historical data for timeframe {tf} to {data_file_tf}")
+
+    def delete_old_data(self, days_to_keep=15):
+        # Delete historical data files older than days_to_keep days
+        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+        cutoff_timestamp = cutoff_date.timestamp()
+        for file in glob.glob(f"{self.data_file_prefix}_*"):
+            # Extract date from filename
+            date_part = file.split('_')[-1].replace('.pkl', '')
+            try:
+                file_date = datetime.strptime(date_part, '%Y%m%d')
+                if file_date < cutoff_date:
+                    os.remove(file)
+                    logging.info(f"Deleted old data file: {file}")
+            except ValueError:
+                # Skip files that don't match the date format
+                continue
 
     def reset(self):
         self.prev_observation = None
@@ -214,8 +233,25 @@ class TradingEnv(gym.Env):
         # Convert obs to numpy array
         obs = np.array(obs, dtype=np.float32)
 
-        # Execute action and calculate reward
-        reward = self.execute_trade(action)
+        # Get positions for this symbol
+        positions = mt5.positions_get(symbol=self.symbol)
+        positions_count = len(positions)
+
+        # Modify action based on whether a position is open
+        if positions_count > 0:
+            # There is an open position
+            if action in [0, 1]:
+                # Ignore Buy or Sell actions when position is open
+                action = 2  # Set action to Hold
+            # Execute action and calculate reward
+            reward = self.execute_trade(action)
+        else:
+            # No open position
+            if action in [3]:
+                # Cannot close a position when none is open
+                action = 2  # Set action to Hold
+            # Execute action and calculate reward
+            reward = self.execute_trade(action)
 
         # Log current market price and action every 10 seconds
         current_time = time.time()
@@ -234,11 +270,14 @@ class TradingEnv(gym.Env):
         self.step_count += 1
         if self.step_count % 10 == 0:
             self.save_historical_data()
+            self.delete_old_data(days_to_keep=15)
 
         return obs, reward, done, info
 
     def save_analysis_data(self, timeframe, hist_df):
-        data_file = f"analysis_data_{timeframe}.csv"
+        # Save analysis data with date-based filenames
+        current_date = datetime.now().strftime('%Y%m%d')
+        data_file = f"analysis_data_{timeframe}_{current_date}.csv"
         hist_df['timeframe'] = timeframe  # Add timeframe column
         if not os.path.exists(data_file):
             hist_df.to_csv(data_file, index=False)
@@ -453,8 +492,8 @@ class TradingEnv(gym.Env):
         # Combine data from all timeframes
         combined_data = pd.DataFrame()
         for tf in self.timeframes:
-            data_file = f"analysis_data_{tf}.csv"
-            if os.path.exists(data_file):
+            data_files = glob.glob(f"analysis_data_{tf}_*.csv")
+            for data_file in data_files:
                 df = pd.read_csv(data_file)
                 combined_data = pd.concat([combined_data, df], ignore_index=True)
 
@@ -474,17 +513,30 @@ class TradingEnv(gym.Env):
 # Main script
 if __name__ == "__main__":
     # Initialize the environment
-    env = TradingEnv(symbol='BTCUSD', timeframes=['M1', 'M5', 'M15'], lot_size=0.01, data_file='historical_data.pkl')
-    model_path = "recurrent_ppo_model.zip"
+    env = TradingEnv(symbol='BTCUSD', timeframes=['M1', 'M5', 'M15'], lot_size=0.01, data_file_prefix='historical_data')
+    model_prefix = "recurrent_ppo_model"
     training_start_time = time.time()
     training_duration = 24 * 60 * 60  # Train for 1 day (24 hours)
     save_interval = 60 * 60  # Save model every hour
     last_save_time = training_start_time
 
+    # Model file with date
+    current_date = datetime.now().strftime('%Y%m%d')
+    model_path = f"{model_prefix}_{current_date}.zip"
+
+    # Check if the model exists
     if os.path.exists(model_path):
-        # Load the existing model
-        model = RecurrentPPO.load(model_path, env=env)
-        logging.info("Loaded existing model")
+        # Attempt to load the existing model
+        try:
+            model = RecurrentPPO.load(model_path, env=env)
+            logging.info(f"Loaded existing model from {model_path}")
+        except ValueError as e:
+            logging.error(f"Failed to load existing model due to mismatched observation space: {e}")
+            # Optionally, rename the old model file
+            os.rename(model_path, model_path + "_old")
+            # Create a new model
+            model = RecurrentPPO('MlpLstmPolicy', env, verbose=0)
+            logging.info("Created new RecurrentPPO model due to mismatched observation space")
     else:
         # Create a new model with LSTM policy
         model = RecurrentPPO('MlpLstmPolicy', env, verbose=0)
@@ -522,10 +574,6 @@ if __name__ == "__main__":
                 logging.error(f"Error in environment: {e}")
                 time.sleep(60)
                 continue  # Skip to the next iteration
-
-            if reward != 0:
-                # Collect rollouts and perform training updates periodically
-                pass  # In live trading, immediate training may not be feasible
 
             # If done, reset the environment and LSTM state
             if done:
