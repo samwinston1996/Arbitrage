@@ -213,9 +213,16 @@ class TradingEnv(gym.Env):
             # Calculate trade duration
             trade_duration = 0
             if self.position_type is not None:
-                # Calculate trade duration in minutes
-                position = mt5.positions_get(symbol=self.symbol)[0]
-                trade_duration = (datetime.now() - datetime.fromtimestamp(position.time)).total_seconds() / 60.0
+                # Get positions for this symbol
+                positions = mt5.positions_get(symbol=self.symbol)
+                if positions is not None and len(positions) > 0:
+                    # Calculate trade duration in minutes
+                    position = positions[0]
+                    trade_duration = (datetime.now() - datetime.fromtimestamp(position.time)).total_seconds() / 60.0
+                else:
+                    # No positions found, reset position_type
+                    self.position_type = None
+                    self.current_stop_loss = None  # Reset stop-loss level
 
             # Append the features to the observation list
             obs.extend([
@@ -251,7 +258,7 @@ class TradingEnv(gym.Env):
 
         # Get positions for this symbol
         positions = mt5.positions_get(symbol=self.symbol)
-        positions_count = len(positions)
+        positions_count = len(positions) if positions is not None else 0
 
         # Modify action based on whether a position is open
         if positions_count > 0:
