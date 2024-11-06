@@ -83,9 +83,9 @@ class TradingEnv(gym.Env):
 
         # Initialize moving stop-loss levels
         self.stop_loss_levels = [
-            {'profit_threshold': 0.5, 'stop_loss_profit': 0.1},
             {'profit_threshold': 1.0, 'stop_loss_profit': 0.5},
-            {'profit_threshold': 4.0, 'stop_loss_profit': 2.0},
+            {'profit_threshold': 2.0, 'stop_loss_profit': 1.0},
+            {'profit_threshold': 5.0, 'stop_loss_profit': 2.5},
             {'profit_threshold': 10.0, 'stop_loss_profit': 5.0},
             {'profit_threshold': 20.0, 'stop_loss_profit': 10.0},
             {'profit_threshold': 30.0, 'stop_loss_profit': 20.0},
@@ -315,11 +315,10 @@ class TradingEnv(gym.Env):
 
     def execute_trade(self, action):
         reward = 0
-        log_disallowed_action = False  # Set to True to enable logging disallowed actions
 
         # Get positions for this symbol
         positions = mt5.positions_get(symbol=self.symbol)
-        positions_count = len(positions)
+        positions_count = len(positions) if positions is not None else 0
 
         if positions_count > 0:
             # There is an open position
@@ -333,8 +332,8 @@ class TradingEnv(gym.Env):
             self.update_stop_loss(position, current_profit)
 
             # Check if position has been closed by stop-loss
-            if position.sl == 0.0 and current_profit <= -3:
-                # Stop-Loss at -$3 has been hit
+            if position.sl == 0.0 and current_profit <= -1.3:
+                # Stop-Loss at -$1.3 has been hit
                 # Position should already be closed by the stop-loss order
                 self.log_trade('Stop-Loss Hit', position, current_profit)
                 reward += current_profit  # Negative reward
@@ -343,8 +342,8 @@ class TradingEnv(gym.Env):
                 self.current_stop_loss = None  # Reset stop-loss level
 
             elif action == 3:  # Close Position
-                if current_profit > 0:
-                    # Allow the bot to close the position if in profit
+                if current_profit >= 1.0:
+                    # Allow the bot to close the position if profit is $1 or more
                     result = self.close_position(position)
                     if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
                         # Log the trade closure
@@ -354,10 +353,8 @@ class TradingEnv(gym.Env):
                         self.position_type = None
                         self.current_stop_loss = None  # Reset stop-loss level
                 else:
-                    # Disallow closing at a loss before stop-loss is hit
-                    if log_disallowed_action:
-                        logging.warning("Attempted to close at a loss before stop-loss is hit, action disallowed")
-                    reward -= 1  # Penalize the agent
+                    # Disallow closing at a loss or small profit before profit reaches $1
+                    pass  # Do nothing; action is ignored
             else:
                 # Hold position
                 reward += 0  # No reward
@@ -484,11 +481,11 @@ class TradingEnv(gym.Env):
         if direction == 'BUY':
             price = mt5.symbol_info_tick(self.symbol).ask
             # Calculate initial stop-loss price
-            sl_price = price - (3 / (self.lot_size * contract_size))
+            sl_price = price - (1.3 / (self.lot_size * contract_size))
         else:  # SELL
             price = mt5.symbol_info_tick(self.symbol).bid
             # Calculate initial stop-loss price
-            sl_price = price + (3 / (self.lot_size * contract_size))
+            sl_price = price + (1.3 / (self.lot_size * contract_size))
 
         # Determine filling mode
         filling_type = self.get_filling_mode(symbol_info)
@@ -597,8 +594,8 @@ class TradingEnv(gym.Env):
         # You can implement advanced analysis or machine learning models here
 
         # For demonstration, set example optimized levels
-        optimized_take_profit = 0.7  # Example value
-        optimized_stop_loss = -2.5   # Example value
+        optimized_take_profit = 1.5  # Example value
+        optimized_stop_loss = -1.0   # Example value
 
         # Output the optimized levels
         print(f"Optimized Take-Profit: ${optimized_take_profit:.2f}")
